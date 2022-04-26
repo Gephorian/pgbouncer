@@ -26,15 +26,8 @@
 #include <usual/time.h>
 #include <usual/list.h>
 #include <usual/statlist.h>
-#include <usual/string.h>
-#include <usual/logging.h>
 #include <usual/aatree.h>
-#include <usual/hashing/lookup3.h>
-#include <usual/slab.h>
 #include <usual/socket.h>
-#include <usual/safeio.h>
-#include <usual/mbuf.h>
-#include <usual/strpool.h>
 
 #include <event2/event.h>
 #include <event2/event_struct.h>
@@ -129,11 +122,27 @@ extern int cf_sbuf_len;
 #define DEFAULT_UNIX_SOCKET_DIR ""
 #endif
 
-/* to avoid allocations will use static buffers */
+/*
+ * To avoid allocations, we use static buffers.
+ *
+ * Note that a trailing zero byte is used in each case, so the actual
+ * usable length is one less.
+ */
+
+/* matching NAMEDATALEN */
 #define MAX_DBNAME	64
-#define MAX_USERNAME	64
-/* typical SCRAM-SHA-256 verifier takes at least 133 bytes */
-#define MAX_PASSWORD	160
+
+/*
+ * Ought to match NAMEDATALEN.  Some cloud services use longer user
+ * names, so give it some extra room.
+ */
+#define MAX_USERNAME	128
+
+/*
+ * Some cloud services use very long generated passwords, so give it
+ * plenty of room.
+ */
+#define MAX_PASSWORD	2048
 
 /*
  * AUTH_* symbols are used for both protocol handling and
@@ -278,6 +287,8 @@ struct PgPool {
 	bool last_login_failed:1;
 
 	bool welcome_msg_ready:1;
+
+	int16_t rrcounter;		/* round-robin counter */
 };
 
 #define pool_connected_server_count(pool) ( \
@@ -327,34 +338,35 @@ struct PgDatabase {
 	struct List head;
 	char name[MAX_DBNAME];	/* db name for clients */
 
+	/*
+	 * configuration
+	 */
+	char *host;		/* host or unix socket name */
+	int port;
+	int pool_size;		/* max server connections in one pool */
+	int min_pool_size;	/* min server connections in one pool */
+	int res_pool_size;	/* additional server connections in case of trouble */
+	int pool_mode;		/* pool mode for this database */
+	int max_db_connections;	/* max server connections between all pools */
+	char *connect_query;	/* startup commands to send to server after connect */
+
+	struct PktBuf *startup_params; /* partial StartupMessage (without user) be sent to server */
+	const char *dbname;	/* server-side name, pointer to inside startup_msg */
+	PgUser *forced_user;	/* if not NULL, the user/psw is forced */
+	PgUser *auth_user;	/* if not NULL, users not in userlist.txt will be looked up on the server */
+
+	/*
+	 * run-time state
+	 */
 	bool db_paused;		/* PAUSE <db>; was issued */
 	bool db_wait_close;	/* WAIT_CLOSE was issued for this database */
 	bool db_dead;		/* used on RELOAD/SIGHUP to later detect removed dbs */
 	bool db_auto;		/* is the database auto-created by autodb_connstr */
 	bool db_disabled;	/* is the database accepting new connections? */
 	bool admin;		/* internal console db */
-
-	struct PktBuf *startup_params; /* partial StartupMessage (without user) be sent to server */
-
-	PgUser *forced_user;	/* if not NULL, the user/psw is forced */
-	PgUser *auth_user;	/* if not NULL, users not in userlist.txt will be looked up on the server */
-
-	char *host;		/* host or unix socket name */
-	int port;
-
-	int pool_size;		/* max server connections in one pool */
-	int res_pool_size;	/* additional server connections in case of trouble */
-	int pool_mode;		/* pool mode for this database */
-	int max_db_connections;	/* max server connections between all pools */
-
-	const char *dbname;	/* server-side name, pointer to inside startup_msg */
-
-	/* startup commands to send to server after connect. malloc-ed */
-	char *connect_query;
-
+	bool fake;		/* not a real database, only for mock auth */
 	usec_t inactive_time;	/* when auto-database became inactive (to kill it after timeout) */
 	unsigned active_stamp;	/* set if autodb has connections */
-
 	int connection_count;	/* total connections for this database in all pools */
 
 	struct AATree user_tree;	/* users that have been queried on this database */
@@ -578,7 +590,6 @@ last_socket(struct StatList *slist)
 	return container_of(slist->head.prev, PgSocket, head);
 }
 
-bool requires_auth_file(int);
 void load_config(void);
 
 

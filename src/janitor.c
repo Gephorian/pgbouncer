@@ -22,6 +22,8 @@
 
 #include "bouncer.h"
 
+#include <usual/slab.h>
+
 /* do full maintenance 3x per second */
 static struct timeval full_maint_period = {0, USEC / 3};
 static struct event full_maint_ev;
@@ -423,15 +425,6 @@ static void check_unused_servers(PgPool *pool, struct StatList *slist, bool idle
 	struct List *item, *tmp;
 	usec_t idle, age;
 	PgSocket *server;
-	usec_t lifetime_kill_gap = 0;
-
-	/*
-	 * Calculate the time that disconnects because of server_lifetime
-	 * must be separated.  This avoids the need to re-launch lot
-	 * of connections together.
-	 */
-	if (pool->db->pool_size > 0)
-		lifetime_kill_gap = cf_server_lifetime / pool->db->pool_size;
 
 	/* disconnect idle servers if needed */
 	statlist_for_each_safe(item, slist, tmp) {
@@ -447,10 +440,10 @@ static void check_unused_servers(PgPool *pool, struct StatList *slist, bool idle
 		} else if (server->state == SV_USED && !server->ready) {
 			disconnect_server(server, true, "SV_USED server got dirty");
 		} else if (cf_server_idle_timeout > 0 && idle > cf_server_idle_timeout
-			   && (cf_min_pool_size == 0 || pool_connected_server_count(pool) > cf_min_pool_size)) {
+			   && (pool_min_pool_size(pool) == 0 || pool_connected_server_count(pool) > pool_min_pool_size(pool))) {
 			disconnect_server(server, true, "server idle timeout");
 		} else if (age >= cf_server_lifetime) {
-			if (pool->last_lifetime_disconnect + lifetime_kill_gap <= now) {
+			if (life_over(server)) {
 				disconnect_server(server, true, "server lifetime over");
 				pool->last_lifetime_disconnect = now;
 			}
@@ -471,9 +464,9 @@ static void check_pool_size(PgPool *pool)
 {
 	PgSocket *server;
 	int cur = pool_connected_server_count(pool);
-	int many = cur - (pool->db->pool_size + pool->db->res_pool_size);
+	int many = cur - (pool_pool_size(pool) + pool_res_pool_size(pool));
 
-	Assert(pool->db->pool_size >= 0);
+	Assert(pool_pool_size(pool) >= 0);
 
 	while (many > 0) {
 		server = first_socket(&pool->used_server_list);
@@ -487,8 +480,8 @@ static void check_pool_size(PgPool *pool)
 	}
 
 	/* launch extra connections to satisfy min_pool_size */
-	if (cur < cf_min_pool_size &&
-	    cur < pool->db->pool_size &&
+	if (cur < pool_min_pool_size(pool) &&
+	    cur < pool_pool_size(pool) &&
 	    cf_pause_mode == P_NONE &&
 	    cf_reboot == 0 &&
 	    pool_client_count(pool) > 0)
@@ -664,9 +657,6 @@ static void do_full_maint(evutil_socket_t sock, short flags, void *arg)
 		return;
 	}
 
-	if (requires_auth_file(cf_auth_type))
-		loader_users_check();
-
 	adns_zone_cache_maint(adns);
 }
 
@@ -718,8 +708,7 @@ void kill_database(PgDatabase *db)
 
 	if (db->forced_user)
 		slab_free(user_cache, db->forced_user);
-	if (db->connect_query)
-		free(db->connect_query);
+	free(db->connect_query);
 	if (db->inactive_time) {
 		statlist_remove(&autodatabase_idle_list, &db->head);
 	} else {
@@ -742,9 +731,5 @@ void config_postprocess(void)
 			kill_database(db);
 			continue;
 		}
-		if (db->pool_size < 0)
-			db->pool_size = cf_default_pool_size;
-		if (db->res_pool_size < 0)
-			db->res_pool_size = cf_res_pool_size;
 	}
 }

@@ -19,6 +19,7 @@
 #include "bouncer.h"
 
 #include <usual/netdb.h>
+#include <usual/socket.h>
 
 #if !defined(USE_EVDNS) && !defined(USE_UDNS) && !defined(USE_CARES)
 #define USE_GETADDRINFO_A
@@ -33,10 +34,10 @@
 #ifdef USE_CARES
 #include <ares.h>
 #include <ares_dns.h>
-#ifndef WIN32
-#include <arpa/nameser.h>
+#ifdef HAVE_ARES_NAMESER_H
+#include <ares_nameser.h>
 #else
-#include <nameser.h>
+#include <arpa/nameser.h>
 #endif
 #define ZONE_RECHECK 1
 #else
@@ -1025,10 +1026,8 @@ struct ares_soa_reply {
 static void xares_free_soa(struct ares_soa_reply *soa)
 {
 	if (soa) {
-		if (soa->nsname)
-			free(soa->nsname);
-		if (soa->hostmaster)
-			free(soa->hostmaster);
+		free(soa->nsname);
+		free(soa->hostmaster);
 		free(soa);
 	}
 }
@@ -1134,10 +1133,8 @@ failed:
 
 failed_stat:
 	xares_free_soa(soa);
-	if (qname)
-		free(qname);
-	if (rr_name)
-		free(rr_name);
+	free(qname);
+	free(rr_name);
 	return (status == ARES_EBADNAME) ? ARES_EBADRESP : status;
 }
 

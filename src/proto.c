@@ -27,7 +27,14 @@
  * parse protocol header from struct MBuf
  */
 
-/* parses pkt header from buffer, returns false if failed */
+/*
+ * Parses pkt header from buffer, returns false if failed.
+ *
+ * This handles both regular packets as well as startup/special
+ * packets (which are actually v2-style packets).  Afterwards, the
+ * type and the length is available in pkt independent of what kind
+ * this packet is.
+ */
 bool get_header(struct MBuf *data, PktHdr *pkt)
 {
 	unsigned type;
@@ -43,33 +50,50 @@ bool get_header(struct MBuf *data, PktHdr *pkt)
 	mbuf_copy(data, &hdr);
 
 	if (mbuf_avail_for_read(&hdr) < NEW_HEADER_LEN) {
-		log_noise("get_header: less than 5 bytes available");
+		log_noise("get_header: less than %d bytes available", NEW_HEADER_LEN);
 		return false;
 	}
 	if (!mbuf_get_byte(&hdr, &type8))
 		return false;
 	type = type8;
 	if (type != 0) {
+		/*
+		 * Regular (v3) packet, starts with type byte and
+		 * 4-byte length.
+		 */
+
 		/* wire length does not include type byte */
 		if (!mbuf_get_uint32be(&hdr, &len))
 			return false;
 		len++;
 		got = NEW_HEADER_LEN;
 	} else {
+		/*
+		 * Startup/special (formerly v2) packet, formally
+		 * starts with 4-byte length.  We assume the first
+		 * byte is zero because in current use they shouldn't
+		 * be that long to have more than zero in the MSB.
+		 */
+
+		/* second byte should also be zero */
 		if (!mbuf_get_byte(&hdr, &type8))
 			return false;
 		if (type8 != 0) {
 			log_noise("get_header: unknown special pkt");
 			return false;
 		}
+
 		/* don't tolerate partial pkt */
 		if (mbuf_avail_for_read(&hdr) < OLD_HEADER_LEN - 2) {
-			log_noise("get_header: less than 8 bytes for special pkt");
+			log_noise("get_header: less than %d bytes for special pkt", OLD_HEADER_LEN);
 			return false;
 		}
+
 		if (!mbuf_get_uint16be(&hdr, &len16))
 			return false;
 		len = len16;
+
+		/* 4-byte code follows */
 		if (!mbuf_get_uint32be(&hdr, &code))
 			return false;
 		if (code == PKT_CANCEL) {
@@ -113,9 +137,15 @@ bool get_header(struct MBuf *data, PktHdr *pkt)
 
 /*
  * Send error message packet to client.
+ *
+ * If level_fatal is true, use severity "FATAL", else "ERROR".  Although it is
+ * not technically part of the protocol specification, some clients expect the
+ * connection to be closed after receiving a FATAL error, and don't expect it
+ * to be closed after an ERROR-level error.  So to be nice, level_fatal should
+ * be true if the caller plans to close the connection after sending this
+ * error.
  */
-
-bool send_pooler_error(PgSocket *client, bool send_ready, const char *msg)
+bool send_pooler_error(PgSocket *client, bool send_ready, bool level_fatal, const char *msg)
 {
 	uint8_t tmpbuf[512];
 	PktBuf buf;
@@ -125,7 +155,8 @@ bool send_pooler_error(PgSocket *client, bool send_ready, const char *msg)
 
 	pktbuf_static(&buf, tmpbuf, sizeof(tmpbuf));
 	pktbuf_write_generic(&buf, 'E', "cscscsc",
-			     'S', "ERROR", 'C', "08P01", 'M', msg, 0);
+			     'S', level_fatal ? "FATAL" : "ERROR",
+			     'C', "08P01", 'M', msg, 0);
 	if (send_ready)
 		pktbuf_write_ReadyForQuery(&buf);
 	return pktbuf_send_immediate(&buf, client);
@@ -518,7 +549,7 @@ bool answer_authreq(PgSocket *server, PktHdr *pkt)
 		break;
 	}
 	default:
-		slog_error(server, "unknown/unsupported auth method: %d", cmd);
+		slog_error(server, "unknown/unsupported auth method: %u", cmd);
 		res = false;
 		break;
 	}

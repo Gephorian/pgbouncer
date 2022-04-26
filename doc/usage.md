@@ -162,6 +162,10 @@ Additionally, the user name **pgbouncer** is allowed to log in without password,
 if the login comes via the Unix socket and the client has same Unix user UID
 as the running process.
 
+The admin console currently only supports the simple query protocol.
+Some drivers use the extended query protocol for all commands; these
+drivers will not work for this.
+
 ### Show commands
 
 The **SHOW** commands output information. Each command is described below.
@@ -365,6 +369,9 @@ cl_active
 cl_waiting
 :   Client connections that have sent queries but have not yet got a server connection.
 
+cl_cancel_req
+:   Client connections that have not forwarded query cancellations to the server yet.
+
 sv_active
 :   Server connections that are linked to a client.
 
@@ -463,6 +470,9 @@ force_user
 
 pool_size
 :   Maximum number of server connections.
+
+min_pool_size
+:   Minimum number of server connections.
 
 reserve_pool
 :   Maximum number of additional connections for this database.
@@ -656,8 +666,10 @@ The PgBouncer process will exit.
 
 #### RELOAD
 
-The PgBouncer process will reload its configuration file and update
-changeable settings.
+The PgBouncer process will reload its configuration files and update
+changeable settings.  This includes the main configuration file as
+well as the files specified by the settings `auth_file` and
+`auth_hba_file`.
 
 PgBouncer notices when a configuration file reload changes the
 connection parameters of a database definition.  An existing server

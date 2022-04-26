@@ -25,6 +25,9 @@
 #include <usual/regex.h>
 #include <usual/netdb.h>
 #include <usual/endian.h>
+#include <usual/safeio.h>
+#include <usual/slab.h>
+#include <usual/strpool.h>
 
 /* regex elements */
 #define WS0	"[ \t\n\r]*"
@@ -105,7 +108,7 @@ bool admin_error(PgSocket *admin, const char *fmt, ...)
 
 	log_error("%s", str);
 	if (admin)
-		res = send_pooler_error(admin, true, str);
+		res = send_pooler_error(admin, true, false, str);
 	return res;
 }
 
@@ -234,8 +237,13 @@ static bool admin_set(PgSocket *admin, const char *key, const char *val)
 	if (admin->admin_user) {
 		ok = set_config_param(key, val);
 		if (ok) {
+			PktBuf *buf = pktbuf_dynamic(256);
+			if (strstr(key, "_tls_") != NULL) {
+				if (!sbuf_tls_setup())
+					pktbuf_write_Notice(buf, "TLS settings could not be applied, still using old configuration");
+			}
 			snprintf(tmp, sizeof(tmp), "SET %s=%s", key, val);
-			return admin_ready(admin, tmp);
+			return admin_flush(admin, buf, tmp);
 		} else {
 			return admin_error(admin, "SET failed");
 		}
@@ -492,9 +500,9 @@ static bool admin_show_databases(PgSocket *admin, const char *arg)
 		return true;
 	}
 
-	pktbuf_write_RowDescription(buf, "ssissiisiiii",
+	pktbuf_write_RowDescription(buf, "ssissiiisiiii",
 				    "name", "host", "port",
-				    "database", "force_user", "pool_size", "reserve_pool",
+				    "database", "force_user", "pool_size", "min_pool_size", "reserve_pool",
 				    "pool_mode", "max_connections", "current_connections", "paused", "disabled");
 	statlist_for_each(item, &database_list) {
 		db = container_of(item, PgDatabase, head);
@@ -504,11 +512,12 @@ static bool admin_show_databases(PgSocket *admin, const char *arg)
 		cv.value_p = &db->pool_mode;
 		if (db->pool_mode != POOL_INHERIT)
 			pool_mode_str = cf_get_lookup(&cv);
-		pktbuf_write_DataRow(buf, "ssissiisiiii",
+		pktbuf_write_DataRow(buf, "ssissiiisiiii",
 				     db->name, db->host, db->port,
 				     db->dbname, f_user,
-				     db->pool_size,
-				     db->res_pool_size,
+				     db->pool_size >= 0 ? db->pool_size : cf_default_pool_size,
+				     db->min_pool_size >= 0 ? db->min_pool_size : cf_min_pool_size,
+				     db->res_pool_size >= 0 ? db->res_pool_size : cf_res_pool_size,
 				     pool_mode_str,
 				     database_max_connections(db),
 				     db->connection_count,
@@ -813,6 +822,7 @@ static bool admin_show_pools(PgSocket *admin, const char *arg)
 	pktbuf_write_RowDescription(buf, "ssiiiiiiiiiis",
 				    "database", "user",
 				    "cl_active", "cl_waiting",
+				    "cl_cancel_req",
 				    "sv_active", "sv_idle",
 				    "sv_used", "sv_tested",
 				    "sv_login", "sv_cancel",
@@ -827,6 +837,7 @@ static bool admin_show_pools(PgSocket *admin, const char *arg)
 				     pool->db->name, pool->user->name,
 				     statlist_count(&pool->active_client_list),
 				     statlist_count(&pool->waiting_client_list),
+				     statlist_count(&pool->cancel_req_list),
 				     statlist_count(&pool->active_server_list),
 				     statlist_count(&pool->idle_server_list),
 				     statlist_count(&pool->used_server_list),
@@ -973,6 +984,8 @@ static bool admin_cmd_reload(PgSocket *admin, const char *arg)
 
 	log_info("RELOAD command issued");
 	load_config();
+	if (!sbuf_tls_setup())
+		log_error("TLS configuration could not be reloaded, keeping old configuration");
 	return admin_ready(admin, "RELOAD");
 }
 
@@ -1471,9 +1484,19 @@ bool admin_handle_client(PgSocket *admin, PktHdr *pkt)
 	case 'X':
 		disconnect_client(admin, false, "close req");
 		break;
+	case 'P':
+	case 'B':
+	case 'E':
+		/*
+		 * Effectively the same as the default case, but give
+		 * a more helpful error message in these cases.
+		 */
+		admin_error(admin, "extended query protocol not supported by admin console");
+		disconnect_client(admin, true, "bad packet");
+		break;
 	default:
-		admin_error(admin, "unsupported pkt type: %d", pkt_desc(pkt));
-		disconnect_client(admin, true, "bad pkt");
+		admin_error(admin, "unsupported packet type for admin console: %d", pkt_desc(pkt));
+		disconnect_client(admin, true, "bad packet");
 		break;
 	}
 	return false;

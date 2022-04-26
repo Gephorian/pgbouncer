@@ -30,7 +30,7 @@ pgctl() {
 
 ulimit -c unlimited
 
-which initdb > /dev/null || {
+command -v initdb > /dev/null || {
 	echo "initdb not found, need postgres tools in PATH"
 	exit 1
 }
@@ -52,7 +52,6 @@ case `uname` in
 		;;
 esac
 
-# System configuration checks
 SED_ERE_OP='-E'
 case `uname` in
 Linux)
@@ -79,14 +78,22 @@ if ! $use_unix_sockets; then
 	BOUNCER_ADMIN_HOST=127.0.0.1
 
 	cp test.ini test.ini.bak
-	sed -i 's/^unix_socket_dir =/#&/' test.ini
+	echo "unix_socket_dir = ''" >> test.ini
 	echo 'admin_users = pgbouncer' >> test.ini
 fi
 
-# System configuration checks
+MAX_PASSWORD=$(sed -n $SED_ERE_OP 's/#define MAX_PASSWORD[[:space:]]+([0-9]+)/\1/p' ../include/bouncer.h)
+# Up to PostgreSQL 13, the server can handle passwords up to 996 bytes
+# (including zero byte), after that it's longer.
+if test $pg_majorversion -lt 14 -a $MAX_PASSWORD -gt 996; then
+	MAX_PASSWORD=996
+fi
+long_password=$(printf '%*s' $(($MAX_PASSWORD - 1)) | tr ' ' 'a')
+
 if ! grep -q "^\"${USER:=$(id -un)}\"" userlist.txt; then
 	cp userlist.txt userlist.txt.bak
 	echo "\"${USER}\" \"01234\"" >> userlist.txt
+	echo "\"longpass\" \"${long_password}\"" >> userlist.txt
 fi
 
 if test -n "$USE_SUDO"; then
@@ -124,16 +131,26 @@ rm -rf $PGDATA
 
 if [ ! -d $PGDATA ]; then
 	mkdir $PGDATA
-	initdb --nosync >> $PG_LOG 2>&1
+	initdb -A trust --nosync >> $PG_LOG
 	if $use_unix_sockets; then
-		sed $SED_ERE_OP -i "/unix_socket_director/s:.*(unix_socket_director.*=).*:\\1 '/tmp':" pgdata/postgresql.conf
+		echo "unix_socket_directories = '/tmp'" >> pgdata/postgresql.conf
 	fi
+	# We need to make the log go to stderr so that the tests can
+	# check what is being logged.  This should be the default, but
+	# some packagings change the default configuration.
 	cat >>pgdata/postgresql.conf <<-EOF
+	logging_collector = off
+	log_destination = stderr
 	log_connections = on
 	EOF
+	if $use_unix_sockets; then
+		local='local'
+	else
+		local='#local'
+	fi
 	if $pg_supports_scram; then
 		cat >pgdata/pg_hba.conf <<-EOF
-		local  p6   all                scram-sha-256
+		$local  p6   all                scram-sha-256
 		host   p6   all  127.0.0.1/32  scram-sha-256
 		host   p6   all  ::1/128       scram-sha-256
 		EOF
@@ -141,19 +158,16 @@ if [ ! -d $PGDATA ]; then
 		cat >pgdata/pg_hba.conf </dev/null
 	fi
 	cat >>pgdata/pg_hba.conf <<-EOF
-	local  p4   all                password
+	$local  p4   all                password
 	host   p4   all  127.0.0.1/32  password
 	host   p4   all  ::1/128       password
-	local  p5   all                md5
+	$local  p5   all                md5
 	host   p5   all  127.0.0.1/32  md5
 	host   p5   all  ::1/128       md5
-	local  all  all                trust
+	$local  all  all                trust
 	host   all  all  127.0.0.1/32  trust
 	host   all  all  ::1/128       trust
 	EOF
-	if ! $use_unix_sockets; then
-		sed -i 's/^local/#local/' pgdata/pg_hba.conf
-	fi
 fi
 
 pgctl start
@@ -171,6 +185,7 @@ psql -X -p $PG_PORT -d p0 -c "select * from pg_user" | grep pswcheck > /dev/null
 	psql -X -o /dev/null -p $PG_PORT -c "create user pswcheck with superuser createdb password 'pgbouncer-check';" p0 || exit 1
 	psql -X -o /dev/null -p $PG_PORT -c "create user someuser with password 'anypasswd';" p0 || exit 1
 	psql -X -o /dev/null -p $PG_PORT -c "create user maxedout;" p0 || exit 1
+	psql -X -o /dev/null -p $PG_PORT -c "create user longpass with password '$long_password';" p0 || exit 1
 	if $pg_supports_scram; then
 		psql -X -o /dev/null -p $PG_PORT -c "set password_encryption = 'md5'; create user muser1 password 'foo';" p0 || exit 1
 		psql -X -o /dev/null -p $PG_PORT -c "set password_encryption = 'md5'; create user muser2 password 'wrong';" p0 || exit 1
@@ -333,6 +348,10 @@ test_show_version() {
 	echo "v2=$v2"
 
 	test x"$v1" = x"$v2"
+}
+
+test_help() {
+	$BOUNCER_EXE --help || return 1
 }
 
 # test all the show commands
@@ -554,7 +573,65 @@ test_pool_size() {
 	test `docount p0` -eq 2 || return 1
 	test `docount p1` -eq 5 || return 1
 
+	# test reload (GH issue #248)
+	admin "set default_pool_size = 7"
+	test `docount p1` -eq 7 || return 1
+
 	return 0
+}
+
+test_min_pool_size() {
+	# make existing connections go away
+	psql -X -p $PG_PORT -d postgres -c "select pg_terminate_backend(pid) from pg_stat_activity where usename='bouncer'"
+	until test $(psql -X -p $PG_PORT -d postgres -tAq -c "select count(1) from pg_stat_activity where usename='bouncer'") -eq 0; do sleep 0.1; done
+
+	# default_pool_size=5
+	admin "set min_pool_size = 3"
+
+	cnt=`psql -X -p $PG_PORT -tAq -c "select count(1) from pg_stat_activity where usename='bouncer' and datname='p1'" postgres`
+	echo $cnt
+	test "$cnt" -eq 0 || return 1
+
+	# It's a bit tricky to get the timing of this test to work
+	# robustly: Full maintenance runs three times a second, so we
+	# need to wait at least 1/3 seconds for it to notice for sure
+	# that the pool is in use.  When it does, it will launch one
+	# connection per round, so we need to wait at least 3 * 1/3
+	# second before all the min pool connections are launched.
+	# Also, we need to keep the query running while this is
+	# happening so that the pool doesn't become momentarily
+	# unused.
+	psql -X -c "select pg_sleep(2)" p1 &
+	sleep 2
+
+	cnt=`psql -X -p $PG_PORT -tAq -c "select count(1) from pg_stat_activity where usename='bouncer' and datname='p1'" postgres`
+	echo $cnt
+	test "$cnt" -eq 3 || return 1
+}
+
+test_reserve_pool_size() {
+	# make existing connections go away
+	psql -X -p $PG_PORT -d postgres -c "select pg_terminate_backend(pid) from pg_stat_activity where usename='bouncer'"
+	until test $(psql -X -p $PG_PORT -d postgres -tAq -c "select count(1) from pg_stat_activity where usename='bouncer'") -eq 0; do sleep 0.1; done
+
+	# default_pool_size=5
+	admin "set reserve_pool_size = 3"
+
+	for i in {1..8}; do
+		psql -X -c "select pg_sleep(8)" p1 >/dev/null &
+	done
+	sleep 1
+	cnt=`psql -X -p $PG_PORT -tAq -c "select count(1) from pg_stat_activity where usename='bouncer' and datname='p1'" postgres`
+	echo $cnt
+	test "$cnt" -eq 5 || return 1
+
+	sleep 7  # reserve_pool_timeout + wiggle room
+
+	cnt=`psql -X -p $PG_PORT -tAq -c "select count(1) from pg_stat_activity where usename='bouncer' and datname='p1'" postgres`
+	echo $cnt
+	test "$cnt" -eq 8 || return 1
+
+	grep "taking connection from reserve_pool" $BOUNCER_LOG || return 1
 }
 
 test_max_db_connections() {
@@ -592,6 +669,22 @@ test_max_user_connections() {
 	}
 
 	test `docount` -eq 3 || return 1
+
+	return 0
+}
+
+test_connect_query() {
+	# The p8 database definition in test.ini has some GUC settings
+	# in connect_query.  Check that they get set.  (The particular
+	# settings don't matter; just use some that are easy to set
+	# and read.)
+
+	result=`psql -X -tAq -c "show enable_seqscan" p8`
+	echo "enable_seqscan=$result"
+	test "$result" = "off" || return 1
+	result=`psql -X -tAq -c "show enable_nestloop" p8`
+	echo "enable_nestloop=$result"
+	test "$result" = "off" || return 1
 
 	return 0
 }
@@ -671,7 +764,7 @@ test_enable_disable() {
 	grep -q "enabled 1" $LOGDIR/test.tmp || return 1
 	grep -q "enabled 2" $LOGDIR/test.tmp || return 1
 	grep -q "disabled 1" $LOGDIR/test.tmp && return 1
-	grep -q "does not allow" $LOGDIR/test.tmp || return 1
+	grep -q "is disabled" $LOGDIR/test.tmp || return 1
 	return 0
 }
 
@@ -832,6 +925,9 @@ test_password_server() {
 	# bad password from auth_file
 	psql -X -c "select 1" p4z && return 1
 
+	# long password from auth_file
+	psql -X -c "select 1" p4l || return 1
+
 	return 0
 }
 
@@ -847,6 +943,10 @@ test_password_client() {
 	PGPASSWORD=foo psql -X -U puser1 -c "select 1" p1 || return 1
 	# bad password
 	PGPASSWORD=wrong psql -X -U puser2 -c "select 2" p1 && return 1
+	# long password
+	PGPASSWORD=$long_password psql -X -U longpass -c "select 3" p1 || return 1
+	# too long password
+	PGPASSWORD=X$long_password psql -X -U longpass -c "select 4" p1 && return 1
 
 	# test with users that have an md5 password stored
 
@@ -1125,8 +1225,49 @@ test_no_user_auth_user() {
 }
 
 test_auto_database() {
-	psql -X -d p7 -c "select current_database()" || return 1
-	grep -F "registered new auto-database" $BOUNCER_LOG || return 1
+	cp test.ini test.ini.bak
+	sed 's/^;\*/*/g' test.ini >test2.ini
+	mv test2.ini test.ini
+
+	admin "reload"
+
+	psql -X -d p7 -c "select current_database()"
+	status1=$?
+	grep -F "registered new auto-database" $BOUNCER_LOG
+	status2=$?
+
+	cp test.ini.bak test.ini
+	rm test.ini.bak
+
+	test $status1 -eq 0 -a $status2 -eq 0
+}
+
+test_no_database() {
+	psql -X -d nosuchdb1 -c "select 1" && return 1
+	grep -F "no such database: nosuchdb1" $BOUNCER_LOG || return 1
+
+	return 0
+}
+
+test_no_database_authfail() {
+	$have_getpeereid || return 77
+
+	admin "set auth_type='md5'"
+
+	PGPASSWORD=wrong psql -X -d nosuchdb1 -c "select 1" && return 1
+	grep -F "closing because: password authentication failed" $BOUNCER_LOG || return 1
+
+	return 0
+}
+
+test_no_database_auth_user() {
+	$have_getpeereid || return 77
+
+	admin "set auth_type='md5'"
+	admin "set auth_user='pswcheck'"
+
+	PGPASSWORD=wrong psql -X -d nosuchdb1 -U someuser -c "select 1" && return 1
+	grep "closing because: password authentication failed" $BOUNCER_LOG || return 1
 
 	return 0
 }
@@ -1216,8 +1357,42 @@ test_cancel_pool_size() {
 	return 0
 }
 
+# This test checks database specifications with host lists.  The way
+# we test this here is to have a host list containing an IPv4 and an
+# IPv6 representation of localhost, and then we check the log that
+# both connections were made.  Some CI environments don't have IPv6
+# localhost configured.  Therefore, this test is skipped by default
+# and needs to be enabled explicitly by setting HAVE_IPV6_LOCALHOST to
+# non-empty.
+test_host_list() {
+	test -z "$HAVE_IPV6_LOCALHOST" && return 77
+
+	psql -X -d hostlist1 -c 'select pg_sleep(1)' >/dev/null &
+	psql -X -d hostlist1 -c 'select 1'
+	psql -X -d hostlist1 -c 'select 2'
+
+	grep -F 'hostlist1/bouncer@127.0.0.1:6666 new connection to server' $BOUNCER_LOG || return 1
+	grep -F 'hostlist1/bouncer@[::1]:6666 new connection to server' $BOUNCER_LOG || return 1
+	return 0
+}
+
+# This is the same test as above, except it doesn't use any IPv6
+# addresses.  So we can't actually tell apart that two separate
+# connections are made.  But the test is useful to get some test
+# coverage (valgrind etc.) of the host list code on systems without
+# IPv6 enabled.
+test_host_list_dummy() {
+	psql -X -d hostlist2 -c 'select pg_sleep(1)' >/dev/null &
+	psql -X -d hostlist2 -c 'select 1'
+	psql -X -d hostlist2 -c 'select 2'
+
+	grep -F 'hostlist2/bouncer@127.0.0.1:6666 new connection to server' $BOUNCER_LOG || return 1
+	return 0
+}
+
 testlist="
 test_show_version
+test_help
 test_show
 test_server_login_retry
 test_auth_user
@@ -1232,8 +1407,11 @@ test_server_check_delay
 test_tcp_user_timeout
 test_max_client_conn
 test_pool_size
+test_min_pool_size
+test_reserve_pool_size
 test_max_db_connections
 test_max_user_connections
+test_connect_query
 test_online_restart
 test_pause_resume
 test_suspend_resume
@@ -1261,9 +1439,14 @@ test_no_user_scram
 test_no_user_scram_forced_user
 test_no_user_auth_user
 test_auto_database
+test_no_database
+test_no_database_authfail
+test_no_database_auth_user
 test_cancel
 test_cancel_wait
 test_cancel_pool_size
+test_host_list
+test_host_list_dummy
 "
 
 if [ $# -gt 0 ]; then

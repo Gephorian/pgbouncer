@@ -145,7 +145,8 @@ static void start_auth_query(PgSocket *client, const char *username)
 		 */
 	}
 	if (!res)
-		disconnect_server(client->link, false, "unable to send login query");
+		disconnect_server(client->link, false, "unable to send auth_query");
+	client->expect_rfq_count++;
 }
 
 static bool login_via_cert(PgSocket *client)
@@ -195,7 +196,7 @@ static bool finish_set_pool(PgSocket *client, bool takeover)
 	bool ok = false;
 	int auth;
 
-	if (!client->login_user->mock_auth) {
+	if (!client->login_user->mock_auth && !client->db->fake) {
 		PgUser *pool_user;
 
 		if (client->db->forced_user)
@@ -221,9 +222,6 @@ static bool finish_set_pool(PgSocket *client, bool takeover)
 				  client->db->name, client->login_user->name);
 		}
 	}
-
-	if (!check_fast_fail(client))
-		return false;
 
 	if (takeover)
 		return true;
@@ -288,20 +286,13 @@ bool set_pool(PgSocket *client, const char *dbname, const char *username, const 
 	client->db = find_database(dbname);
 	if (!client->db) {
 		client->db = register_auto_database(dbname);
-		if (!client->db) {
-			disconnect_client(client, true, "no such database: %s", dbname);
-			if (cf_log_connections)
-				slog_info(client, "login failed: db=%s user=%s", dbname, username);
-			return false;
-		} else {
+		if (client->db)
 			slog_info(client, "registered new auto-database: db=%s", dbname);
-		}
 	}
-
-	/* are new connections allowed? */
-	if (client->db->db_disabled) {
-		disconnect_client(client, true, "database does not allow connections: %s", dbname);
-		return false;
+	if (!client->db) {
+		client->db = calloc(1, sizeof(*client->db));
+		client->db->fake = true;
+		strlcpy(client->db->name, dbname, sizeof(client->db->name));
 	}
 
 	if (client->db->admin) {
@@ -362,12 +353,16 @@ bool set_pool(PgSocket *client, const char *dbname, const char *username, const 
 					client->db->auth_user = add_user(cf_auth_user, "");
 			}
 			if (client->db->auth_user) {
-				if (takeover) {
-					client->login_user = add_db_user(client->db, username, password);
-					return finish_set_pool(client, takeover);
+				if (client->db->fake)
+					slog_debug(client, "not running auth_query because database is fake");
+				else {
+					if (takeover) {
+						client->login_user = add_db_user(client->db, username, password);
+						return finish_set_pool(client, takeover);
+					}
+					start_auth_query(client, username);
+					return false;
 				}
-				start_auth_query(client, username);
-				return false;
 			}
 
 			slog_info(client, "no such user: %s", username);
@@ -394,7 +389,7 @@ bool handle_auth_query_response(PgSocket *client, PktHdr *pkt) {
 			return false;
 		}
 		if (columns != 2u) {
-			disconnect_server(server, false, "expected 2 columns from login query, not %hu", columns);
+			disconnect_server(server, false, "expected 2 columns from auth_query, not %hu", columns);
 			return false;
 		}
 		break;
@@ -405,7 +400,7 @@ bool handle_auth_query_response(PgSocket *client, PktHdr *pkt) {
 			return false;
 		}
 		if (columns != 2u) {
-			disconnect_server(server, false, "expected 2 columns from login query, not %hu", columns);
+			disconnect_server(server, false, "expected 2 columns from auth_query, not %hu", columns);
 			return false;
 		}
 		if (!mbuf_get_uint32be(&pkt->data, &length)) {
@@ -413,7 +408,7 @@ bool handle_auth_query_response(PgSocket *client, PktHdr *pkt) {
 			return false;
 		}
 		if (length == (uint32_t)-1) {
-			disconnect_server(server, false, "login query response contained null user name");
+			disconnect_server(server, false, "auth_query response contained null user name");
 			return false;
 		}
 		if (!mbuf_get_chars(&pkt->data, length, &username)) {
@@ -490,8 +485,11 @@ bool handle_auth_query_response(PgSocket *client, PktHdr *pkt) {
 		if (server->state == SV_FREE || server->state == SV_JUSTFREE)
 			return false;
 		return true;
+	case 'E':	/* ErrorResponse */
+		disconnect_server(server, false, "error response from auth_query");
+		return false;
 	default:
-		disconnect_server(server, false, "unexpected response from login query");
+		disconnect_server(server, false, "unexpected response from auth_query");
 		return false;
 	}
 	sbuf_prepare_skip(&server->sbuf, pkt->len);
@@ -718,7 +716,7 @@ static bool handle_client_startup(PgSocket *client, PktHdr *pkt)
 			disconnect_client(client, false, "SSL req inside SSL");
 			return false;
 		}
-		if (cf_client_tls_sslmode != SSLMODE_DISABLED && !is_unix) {
+		if (client_accept_sslmode != SSLMODE_DISABLED && !is_unix) {
 			slog_noise(client, "P: SSL ack");
 			if (!sbuf_answer(&client->sbuf, "S", 1)) {
 				disconnect_client(client, false, "failed to ack SSL");
@@ -751,7 +749,7 @@ static bool handle_client_startup(PgSocket *client, PktHdr *pkt)
 		return false;
 	case PKT_STARTUP:
 		/* require SSL except on unix socket */
-		if (cf_client_tls_sslmode >= SSLMODE_REQUIRE && !client->sbuf.tls && !is_unix) {
+		if (client_accept_sslmode >= SSLMODE_REQUIRE && !client->sbuf.tls && !is_unix) {
 			disconnect_client(client, true, "SSL required");
 			return false;
 		}
@@ -924,7 +922,7 @@ static bool handle_client_work(PgSocket *client, PktHdr *pkt)
 
 	/* client wants to go away */
 	default:
-		slog_error(client, "unknown pkt from client: %d/0x%x", pkt->type, pkt->type);
+		slog_error(client, "unknown pkt from client: %u/0x%x", pkt->type, pkt->type);
 		disconnect_client(client, true, "unknown pkt");
 		return false;
 	case 'X': /* Terminate */
@@ -1013,7 +1011,25 @@ bool client_proto(SBuf *sbuf, SBufEvent evtype, struct MBuf *data)
 					  hdr2hex(data, hex, sizeof(hex)));
 			return false;
 		}
-		slog_noise(client, "read pkt='%c' len=%d", pkt_desc(&pkt), pkt.len);
+		slog_noise(client, "read pkt='%c' len=%u", pkt_desc(&pkt), pkt.len);
+
+		/*
+		 * If we are reading an SSL request or GSSAPI
+		 * encryption request, we should have no data already
+		 * buffered at this point.  If we do, it was received
+		 * before we performed the SSL or GSSAPI handshake, so
+		 * it wasn't encrypted and indeed may have been
+		 * injected by a man-in-the-middle.  We report this
+		 * case to the client.
+		 */
+		if (pkt.type == PKT_SSLREQ && mbuf_avail_for_read(data) > 0) {
+			disconnect_client(client, true, "received unencrypted data after SSL request");
+			return false;
+		}
+		if (pkt.type == PKT_GSSENCREQ && mbuf_avail_for_read(data) > 0) {
+			disconnect_client(client, true, "received unencrypted data after GSSAPI encryption request");
+			return false;
+		}
 
 		client->request_time = get_cached_time();
 		switch (client->state) {

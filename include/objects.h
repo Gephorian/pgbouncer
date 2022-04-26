@@ -36,6 +36,7 @@ PgSocket *compare_connections_by_time(PgSocket *lhs, PgSocket *rhs);
 bool evict_connection(PgDatabase *db)		_MUSTCHECK;
 bool evict_user_connection(PgUser *user)	_MUSTCHECK;
 bool find_server(PgSocket *client)		_MUSTCHECK;
+bool life_over(PgSocket *server);
 bool release_server(PgSocket *server)		/* _MUSTCHECK */;
 bool finish_client_login(PgSocket *client)	_MUSTCHECK;
 bool check_fast_fail(PgSocket *client)		_MUSTCHECK;
@@ -78,6 +79,7 @@ void change_server_state(PgSocket *server, SocketState newstate);
 int get_active_client_count(void);
 int get_active_server_count(void);
 
+void tag_pool_dirty(PgPool *pool);
 void tag_database_dirty(PgDatabase *db);
 void tag_autodb_dirty(void);
 void tag_host_addr_dirty(const char *host, const struct sockaddr *sa);

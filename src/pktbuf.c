@@ -39,10 +39,8 @@ void pktbuf_free(PktBuf *buf)
 		return;
 
 	log_debug("pktbuf_free(%p)", buf);
-	if (buf->buf)
-		free(buf->buf);
-	if (buf->ev)
-		free(buf->ev);
+	free(buf->buf);
+	free(buf->ev);
 	free(buf);
 }
 
@@ -160,7 +158,7 @@ bool pktbuf_send_queued(PktBuf *buf, PgSocket *sk)
 
 	if (buf->failed) {
 		pktbuf_free(buf);
-		return send_pooler_error(sk, true, "result prepare failed");
+		return send_pooler_error(sk, true, false, "result prepare failed");
 	} else {
 		buf->sending = true;
 		buf->queued_dst = sk;
